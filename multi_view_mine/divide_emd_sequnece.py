@@ -49,6 +49,11 @@ def sliding_window_disk_data(data, sw_width=30, max_leading_time=14, sliding_win
 disk_files = sorted(os.listdir(temp_dir))
 emd_files = sorted(os.listdir(emd_folder))
 
+# 从第58个批次开始处理
+start_batch = 19
+file_start_idx = start_batch * 1000
+disk_files = disk_files[file_start_idx:]
+emd_files = emd_files[file_start_idx:]
 # 初始化存储变量
 data_k = None
 emd_k = None
