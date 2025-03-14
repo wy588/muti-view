@@ -4,8 +4,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from matplotlib import pyplot as plt
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, ConcatDataset
 from sklearn.metrics import precision_score, recall_score, f1_score
+import os
+from tqdm import tqdm
 
 # 设定随机种子，保证完全复现性
 SEED = 1
@@ -19,58 +21,33 @@ if torch.cuda.is_available():
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 读取数据
-feature_path = "/home/wangy/code/EDITS复现/multi_view_mine/sampled_sequence/merged_combined_features.npy"
-label_path = "/home/wangy/code/EDITS复现/multi_view_mine/sampled_sequence/merged_labels.npy"
+# 数据目录
+data_dir = "/home/wangy/code/EDITS复现/multi_view_mine/sampled_sequence_with_level_new"
 
-# 加载并转换数据类型
-x_all = np.load(feature_path, allow_pickle=True)
-y_all = np.load(label_path, allow_pickle=True)
-
-# 转换数据类型
-x_all = np.array([np.array(x, dtype=np.float32) for x in x_all])
-y_all = np.array(y_all, dtype=np.float32)
-
-print(f"Data shapes - Features: {x_all.shape}, Labels: {y_all.shape}")
-print(f"Data types - Features: {x_all.dtype}, Labels: {y_all.dtype}")
-
-# 转换为 PyTorch 张量
-x_all = torch.tensor(x_all, dtype=torch.float32)
-y_all = torch.tensor(y_all, dtype=torch.float32)
-
-# 使用固定的随机索引进行划分
-indices = torch.randperm(len(x_all), generator=torch.Generator().manual_seed(SEED))
-train_size = int(0.8 * len(x_all))
-
-# 划分训练集和测试集
-train_indices = indices[:train_size]
-test_indices = indices[train_size:]
-
-# 使用索引获取数据
-x_train = x_all[train_indices]
-y_train = y_all[train_indices]
-x_test = x_all[test_indices]
-y_test = y_all[test_indices]
-
-
-# 创建数据加载器，设置随机种子
-g = torch.Generator()
-g.manual_seed(SEED)
-
-train_loader = DataLoader(
-    TensorDataset(x_train, y_train),
-    batch_size=128,
-    shuffle=True,
-    generator=g,
-    worker_init_fn=lambda worker_id: np.random.seed(SEED + worker_id)
-)
-
-test_loader = DataLoader(
-    TensorDataset(x_test, y_test),
-    batch_size=64,
-    shuffle=False
-)
-
+def load_batch_data(data_dir, split='train'):
+    """加载所有batch的数据"""
+    batch_datasets = []
+    
+    batch_files = sorted([f for f in os.listdir(data_dir) if f.startswith(f"{split}_hist_features_batch_")])
+    batch_nums = set([f.split("_")[-1].split(".")[0] for f in batch_files])
+    
+    for batch_num in tqdm(batch_nums, desc=f"Loading {split} batches"):
+        try:
+            x = np.load(os.path.join(data_dir, f"{split}_hist_features_batch_{batch_num}.npy"))
+            y = np.load(os.path.join(data_dir, f"{split}_labels_batch_{batch_num}.npy"))
+            
+            x = torch.tensor(x, dtype=torch.float32)
+            y = torch.tensor(y, dtype=torch.float32)
+            
+            batch_dataset = TensorDataset(x, y)
+            batch_datasets.append(batch_dataset)
+            
+        except Exception as e:
+            print(f"Error loading batch {batch_num}: {str(e)}")
+            continue
+    
+    combined_dataset = ConcatDataset(batch_datasets)
+    return combined_dataset
 
 # LSTM 模型定义
 class LSTMModel(nn.Module):
@@ -84,80 +61,105 @@ class LSTMModel(nn.Module):
         out = self.fc(out[:, -1, :])
         return out
 
+def main():
+    # 加载训练集和测试集
+    print("Loading datasets...")
+    train_dataset = load_batch_data(data_dir, 'train')
+    test_dataset = load_batch_data(data_dir, 'test')
+    
+    # 创建数据加载器
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=128,
+        shuffle=True,
+        generator=g,
+        worker_init_fn=lambda worker_id: np.random.seed(SEED + worker_id)
+    )
 
-# 初始化模型参数
-input_size = 327
-hidden_size = 64
-num_layers = 2
-output_size = 1
-num_epochs = 100
-learning_rate = 1e-3
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=64,
+        shuffle=False
+    )
 
-# 实例化模型，确保权重初始化的随机性也是固定的
-torch.manual_seed(SEED)
-model = LSTMModel(input_size, hidden_size, num_layers, output_size).to(device)
-criterion = nn.BCEWithLogitsLoss()
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # 初始化模型参数
+    input_size = 288
+    hidden_size = 64
+    num_layers = 2
+    output_size = 1
+    num_epochs = 100
+    learning_rate = 1e-3
 
-# 训练过程
-f1_scores = []
-best_f1 = 0.0
+    # 实例化模型
+    torch.manual_seed(SEED)
+    model = LSTMModel(input_size, hidden_size, num_layers, output_size).to(device)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-for epoch in range(1, num_epochs + 1):
-    model.train()
-    total_loss = 0
+    # 训练过程
+    print("Starting training...")
+    losses = []  # 记录训练损失
 
-    for i, (x_batch, y_batch) in enumerate(train_loader):
-        if i == 0 and epoch == 1:
-            print("First batch first sample:", x_batch[0, 0, :5].tolist())  # 验证随机性
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        total_loss = 0
+        
+        for x_batch, y_batch in tqdm(train_loader, desc=f"Epoch {epoch}"):
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(x_batch)
+            loss = criterion(outputs.squeeze(), y_batch)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
 
-        x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-        optimizer.zero_grad()
-        outputs = model(x_batch)
-        loss = criterion(outputs.squeeze(), y_batch)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
+        avg_loss = total_loss / len(train_loader)
+        losses.append(avg_loss)
+        print(f"Epoch [{epoch}/{num_epochs}], Loss: {avg_loss:.4f}")
 
-    avg_loss = total_loss / len(train_loader)
-    print(f"Epoch [{epoch}/{num_epochs}], Loss: {avg_loss:.4f}")
+    # 训练完成后进行评估
+    print("\nTraining completed. Starting evaluation...")
+    model.eval()
+    all_preds, all_labels = [], []
 
-    # 每 100 轮评估一次
-    if epoch % 100 == 0:
-        model.eval()
-        all_preds, all_labels = [], []
+    with torch.no_grad():
+        for x_batch, y_batch in tqdm(test_loader, desc="Evaluating"):
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+            outputs = model(x_batch)
+            preds = torch.sigmoid(outputs).squeeze() > 0.5
+            all_preds.append(preds.cpu())
+            all_labels.append(y_batch.cpu())
 
-        with torch.no_grad():
-            for x_batch, y_batch in test_loader:
-                x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-                outputs = model(x_batch)
-                preds = torch.sigmoid(outputs).squeeze() > 0.5
-                all_preds.append(preds.cpu())
-                all_labels.append(y_batch.cpu())
+    predicted_labels = torch.cat(all_preds)
+    true_labels = torch.cat(all_labels)
 
-        predicted_labels = torch.cat(all_preds)
-        true_labels = torch.cat(all_labels)
+    # 计算评估指标
+    accuracy = (predicted_labels == true_labels).float().mean().item()
+    precision = precision_score(true_labels.numpy(), predicted_labels.numpy())
+    recall = recall_score(true_labels.numpy(), predicted_labels.numpy())
+    f1 = f1_score(true_labels.numpy(), predicted_labels.numpy())
 
-        accuracy = (predicted_labels == true_labels).float().mean().item()
-        precision = precision_score(true_labels.numpy(), predicted_labels.numpy())
-        recall = recall_score(true_labels.numpy(), predicted_labels.numpy())
-        f1 = f1_score(true_labels.numpy(), predicted_labels.numpy())
-        f1_scores.append(f1)
+    print("\nFinal Evaluation Results:")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
 
-        # 保存最佳模型
-        if f1 > best_f1:
-            best_f1 = f1
-            torch.save(model.state_dict(), f"/home/wangy/code/EDITS复现/merged_sample_lstm_model_combined_best.pth")
+    # 保存模型
+    torch.save(model.state_dict(), f"{data_dir}/final_hist_lstm_model.pth")
 
-        print(f"Epoch {epoch}:")
-        print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}")
+    # 绘制损失曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, num_epochs + 1), losses, marker='.')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("LSTM Training Loss")
+    plt.grid(True)
+    plt.savefig(f'{data_dir}/lstm_training_loss.png')
+    plt.close()
 
-# 绘制 F1 分数趋势图
-# plt.figure(figsize=(10, 6))
-# plt.plot(range(100, num_epochs + 1, 100), f1_scores, marker='o')
-# plt.xlabel("Epoch")
-# plt.ylabel("F1 Score")
-# plt.title("LSTM Training F1 Score")
-# plt.grid(True)
-# plt.savefig('/home/wangy/code/EDITS复现/lstm_hist_f1_score.png')
-# plt.show()
+if __name__ == "__main__":
+    main()
